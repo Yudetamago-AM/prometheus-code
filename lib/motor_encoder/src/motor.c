@@ -34,7 +34,8 @@ void quadrature_encoder_two_pio_init(PIO pio, uint sm, uint8_t pin_ab_left, uint
 }
 
 void quadrature_encoder_update_delta(PIO pio, uint sm, uint32_t delta[2]) {
-    static uint32_t new_value[2], old_value[2];
+    static uint32_t new_value[2] = {0};
+    static uint32_t old_value[2] = {0};
     quadrature_encoder_request_count(pio, sm);
     quadrature_encoder_request_count(pio, sm+1);
     new_value[0] = quadrature_encoder_fetch_count(pio, sm);
