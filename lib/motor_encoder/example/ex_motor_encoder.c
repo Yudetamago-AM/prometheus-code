@@ -31,6 +31,6 @@ int main() {
 
         //if (pwm >= 1023) pwm = -1023;
         //pwm++;
-        sleep_ms(100);
+        sleep_ms(10);
     }
 }
