@@ -1,3 +1,5 @@
 build/
 tmp/
 .vscode/
+lib/icm20948
+lib/vl53l5cx
