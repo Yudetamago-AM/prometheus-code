@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "../src/pid.h"
+#include "../../src/pid.h"
 #define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
 
 static float target_rotate = 50; // 0 to 70(approx)
