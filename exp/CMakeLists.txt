@@ -1,2 +1,7 @@
 #add_subdirectory("motor_encoder")
 add_subdirectory("pid")
+add_subdirectory("tire")
+add_subdirectory("nichrome")
+add_subdirectory("mag_cal")
+add_subdirectory("rotate")
+add_subdirectory("is_landed")

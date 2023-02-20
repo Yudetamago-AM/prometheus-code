@@ -3,7 +3,8 @@
 #include "../../src/pid.h"
 #define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
 
-static float target_rotate = 50; // 0 to 70(approx)
+static float target_rotate_right = 50; // 0 to 70(approx)
+static float target_rotate_left = 70;
 static uint32_t delta[2];
 static uint8_t slice_left;
 static uint8_t slice_right;
@@ -19,12 +20,12 @@ bool update_pid(repeating_timer_t *rt) {
     static float error_right[2] = {0};
     static float integral_left = 0, integral_right = 0;
     quadrature_encoder_update_delta(pio, 0, delta);
-    int16_t pwml = (int16_t)pid_calc((float)(-delta[0]), target_rotate, error_left, &integral_left);
-    int16_t pwmr = (int16_t)pid_calc((float)(delta[1]), target_rotate, error_right, &integral_right);
+    int16_t pwml = (int16_t)pid_calc((float)(delta[0]), target_rotate_left, error_left, &integral_left);
+    int16_t pwmr = (int16_t)pid_calc((float)(delta[1]), target_rotate_right, error_right, &integral_right);
     pwml = limit_pwm(-pwml); pwmr = limit_pwm(-pwmr);
     motor_rotate(slice_left, pwml);
     motor_rotate(slice_right, pwmr);
-    printf("L pwm %4d, d %3d, i %2.2f R pwm %4d, d %3d, i %2.2f\n", pwml, -delta[0], integral_left, pwmr, delta[1], integral_right);
+    printf("L pwm %4d, d %3d, i %2.2f R pwm %4d, d %3d, i %2.2f\n", pwml, delta[0], integral_left, pwmr, delta[1], integral_right);
 
     return true;
 }
