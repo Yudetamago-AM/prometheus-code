@@ -18,7 +18,7 @@ int main(void) {
         gpio_put(2, 1);
         sleep_ms(100);
         gpio_put(2, 0);
-        sleep_ms(150);
+        sleep_ms(100);
     }
 
     gpio_put(nichrome_pin, 1);

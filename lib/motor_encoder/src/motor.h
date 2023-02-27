@@ -18,6 +18,8 @@ uint8_t motor_init(uint8_t pin);
 /// @param pwm -1023 to 1023. - counterclockwise, 0 stop, + clockwise
 void motor_rotate(uint8_t slice, int16_t pwm);
 
+void motor_brake(uint8_t slice);
+
 // reading encoder
 
 /// @brief initialize pio for reading encoder

@@ -1,4 +1,6 @@
-#add_subdirectory("vl53l5cx")
+add_subdirectory("vl53l5cx")
 add_subdirectory("icm20948")
 add_subdirectory("motor_encoder")
 add_subdirectory("pico-eeprom-i2c")
+add_subdirectory("prometheus-pin")
+add_subdirectory("health_monitor")
