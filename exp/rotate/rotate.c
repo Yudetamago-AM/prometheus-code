@@ -29,8 +29,8 @@ int main(void) {
     uint slice_left = motor_init(20);
     uint slice_right = motor_init(18);
 
-    motor_rotate(slice_left, 1023);
-    motor_rotate(slice_right, 1023);
+    motor_rotate(slice_left, 800);
+    motor_rotate(slice_right, 800);
 
     while (1) tight_loop_contents();
 

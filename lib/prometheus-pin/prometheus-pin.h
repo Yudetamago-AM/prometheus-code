@@ -1,4 +1,7 @@
-#pragma once
+#ifndef PROMETHEUS_PIN_H
+#define PROMETHEUS_PIN_H
+#include <stdio.h>
+#include "pico/stdlib.h"
 
 // motor
 const uint motor_right_a_pin = 18;
@@ -34,3 +37,11 @@ const uint current_sense_pin  = 28;
 // voltage sense
 // V = Vmonitor * 4.0 (V)
 const uint voltage_sense_pin  = 29;
+
+// status led
+const uint led_pin            = 2;
+
+// nichrome
+const uint nichrome_pin       = 17;
+
+#endif
