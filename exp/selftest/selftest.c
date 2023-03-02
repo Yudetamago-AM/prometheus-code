@@ -10,7 +10,6 @@
 #include "../../lib/motor_encoder/src/motor.h"
 #include "../../lib/icm20948/src/pico-icm20948.h"
 #include "../../lib/vl53l5cx/api/vl53l5cx_api.h"
-#include "../../lib/nmea_pico/src/nmea_pico.h"
 #include "../../lib/health_monitor/src/health.h"
 #include "../../lib/pico-eeprom-i2c/src/eeprom.h"
 

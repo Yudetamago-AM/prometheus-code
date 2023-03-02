@@ -13,7 +13,6 @@ target_link_libraries(selftest
     pico-icm20948
     eeprom
     vl53l5cx
-    nmea_pico
 )
 
 
