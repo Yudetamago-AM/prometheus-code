@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
@@ -11,92 +12,519 @@
 #include "../lib/icm20948/src/pico-icm20948.h"
 #include "../lib/icm20948/MadgwickAHRS/MadgwickAHRS.h"
 #include "../lib/vl53l5cx/api/vl53l5cx_api.h"
-#include "../lib/nmea_pico/src/nmea_pico.h"
 #include "../lib/health_monitor/src/health.h"
 #include "../lib/pico-eeprom-i2c/src/eeprom.h"
+#include "../lib/gnss/nmeap-0.3/inc/nmeap.h"
+#include "../exp/pid/src/pid.h"
+#include "util.h"
 
-#define ANGLE_TH 0.39//前45度，GPS誘導
-#define LONGITUDE_PER_RES 111
-#define LATITUDE_PER_RES 92
+#define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
+#define abs(a) (((a)<0)?(-(a)):(a))
+
+#define MODE_WAIT    1
+#define MODE_LANDING 2
+#define MODE_GNSS    3
+#define MODE_TOF     4
+#define MODE_GOAL    5
+#define MODE_FORWARD_LANDING 6
+#define MODE_FORWARD_TOF     7
+
+// 9-axis
+icm20948_config_t config = {0x68, 0x0C, i2c1};
+madgwick_ahrs_t filter = {0.5f, {1.0f, 0.0f, 0.0f, 0.0f}};
+icm20984_data_t icmdata;
+static float euler[3] = {0};
+
+// 投下前手順
+/*
+0. バッテリ電圧を確認する
+1. selftestのクリアを確認する
+2. mode_nowをMODE_WAITにする
+3. 白黒か黄色でゴール座標
+4. 白黒か黄色で地磁気
+*/
+
+// SETTINGS
+// 白黒
+//const int32_t goal_longitude = 130960989;
+//const int32_t goal_latitude  =  30374594;
+
+// 黄色
+const int32_t goal_longitude = 130960978;
+const int32_t goal_latitude  =  30374646;
+
+// 初期モード
+static uint mode_now = MODE_TOF;
+
+const int32_t wait_count = 30 * 100; // 30秒
+const float angle_th = 0.39; //前45度，GPS誘導
+const uint16_t long_per_res = 111; // 種子島
+const uint16_t lat_per_les = 96;
+//
+
+static repeating_timer_t timer;
 
 // tof
 i2c_inst_t vl53l5cx_i2c = {i2c0_hw, false};
+VL53L5CX_Configuration tof_dev;
+VL53L5CX_ResultsData tof_res;
+static uint8_t tof_isready;
 
-// 9-axis
-icm20948_config_t config = {0x68, 0x0C, &icm20948_i2c};
-madgwick_ahrs_t filter = {0.5f, {1.0f, 0.0f, 0.0f, 0.0f}};
-icm20984_data_t data;
+// gps
+nmeap_context_t nmea;
+nmeap_gga_t gga;
+static bool gps_isready = false;
 
-void read_icm20948(repeating_timer_t *rt) {
-    icm20948_read_cal_accel(&config, &data.accel_raw[0], &data.accel_bias[0]);
-    icm20948_read_cal_gyro(&config, &data.gyro_raw[0], &data.gyro_bias[0]);
-    icm20948_read_cal_mag(&config, &data.mag_raw[0], &data.mag_bias[0]);
-    icm20948_read_temp_c(&config, &data.temp_c);
-    accel_g[0] = (float)data.accel_raw[0] / 16384.0f;
-    accel_g[1] = (float)data.accel_raw[1] / 16384.0f;
-    accel_g[2] = (float)data.accel_raw[2] / 16384.0f;
-    gyro_dps[0] = (float)data.gyro_raw[0] / 131.0f;
-    gyro_dps[1] = (float)data.gyro_raw[1] / 131.0f;
-    gyro_dps[2] = (float)data.gyro_raw[2] / 131.0f;
-    mag_ut[0] = (float)data.mag_raw[1];
-    mag_ut[1] = (float)-data.mag_raw[0];
-    mag_ut[2] = (float)-data.mag_raw[2];
-    MadgwickAHRSupdate(&filter, \
-    ((float)data.gyro_raw[0] / 131.0f), ((float)data.gyro_raw[1] / 131.0f), ((float)data.gyro_raw[2] / 131.0f), \
-    ((float)data.accel_raw[0] / 16384.0f) * 9.8, ((float)data.accel_raw[1] / 16384.0f) * 9.8, ((float)data.accel_raw[2] / 16384.0f) * 9.8, \
-    ((float)data.mag_raw[1]), ((float)-data.mag_raw[0]), ((float)-data.mag_raw[2]));
+// motor
+static uint8_t slice_left;
+static uint8_t slice_right;
+PIO pio = pio0;
+uint32_t delta[2];
+
+bool update_all(repeating_timer_t *rt);
+bool is_goal();
+void calc_gps(float *direction, int32_t *distance, int32_t long_now, int32_t lat_now);
+//void calc_gps(float *dir, float *dist, double lon, double lat);
+
+void on_uart_rx() {
+    while (uart_is_readable(uart1)) {
+        uint8_t ch = uart_getc(uart1);
+        nmeap_parse(&nmea, ch);
+    }
 }
 
-void q2e(madgwick_ahrs_t *data, float euler[]) {
+// icm-20948
+void icm20948_calc_data(float accel_g[3], float gyro_dps[3]) {
+    accel_g[0] = -(float)icmdata.accel_raw[1] / 16384.0f; // センサー座標でx
+    accel_g[1] = (float)icmdata.accel_raw[0] / 16384.0f; // センサー座標でy
+    accel_g[2] = (float)icmdata.accel_raw[2] / 16384.0f; // センサー座標でz
+    gyro_dps[0] = -(float)icmdata.gyro_raw[1] / 131.0f; // roll
+    gyro_dps[1] = (float)icmdata.gyro_raw[0] / 131.0f; // pitch
+    gyro_dps[2] = (float)icmdata.gyro_raw[2] / 131.0f; // yaw
+}
+
+float icm20948_calc_yawmag() {
+    // 地磁気をセンサー座標系に合わせる
+    float yawmag;
+    int16_t tmp = icmdata.mag_raw[0];
+    icmdata.mag_raw[0] = icmdata.mag_raw[1]; // x
+    icmdata.mag_raw[1] = tmp;             // y
+    icmdata.mag_raw[2] = -icmdata.mag_raw[2];// z
+    float mx = ((float)icmdata.mag_raw[0])*cos(euler[1]) + ((float)icmdata.mag_raw[1])*sin(euler[0])*sin(euler[1]) + ((float)icmdata.mag_raw[2])*cos(euler[0])*sin(euler[1]);
+    float my = ((float)icmdata.mag_raw[1])*cos(euler[0]) - ((float)icmdata.mag_raw[2])*sin(euler[0]);
+    yawmag = atan2f(my, mx);
+}
+
+void icm20948_read_all(/* icm20948_config_t *config, icm20984_data_t *icmdata */) {
+    icm20948_read_cal_accel(&config, &icmdata.accel_raw[0], &icmdata.accel_bias[0]);
+    icm20948_read_cal_gyro(&config, &icmdata.gyro_raw[0], &icmdata.gyro_bias[0]);
+    icm20948_read_cal_mag(&config, &icmdata.mag_raw[0], &icmdata.mag_bias[0]);
+}
+
+void q2e(madgwick_ahrs_t *icmdata, float euler[]) {
     // 0: roll, 1: pitch, 2: yaw
-    euler[0] = -1.0f * asinf(2.0f * (data->q[1]) * (data->q[3]) + 2.0f * (data->q[0]) * (data->q[2]));
-    euler[1] = atan2f(2.0f * (data->q[2]) * (data->q[3]) - 2.0f * (data->q[0]) * (data->q[1]), 2.0f * (data->q[0]) * (data->q[0]) + 2.0f * (data->q[3]) * (data->q[3]) - 1.0f);
-    euler[2] = atan2f(2.0f * (data->q[1]) * (data->q[2]) - 2.0f * (data->q[0]) * (data->q[3]), 2.0f * (data->q[0]) * (data->q[0]) + 2.0f * (data->q[1]) * (data->q[1]) - 1.0f);
+    euler[0] = -1.0f * asinf(2.0f * (icmdata->q[1]) * (icmdata->q[3]) + 2.0f * (icmdata->q[0]) * (icmdata->q[2]));
+    euler[1] = atan2f(2.0f * (icmdata->q[2]) * (icmdata->q[3]) - 2.0f * (icmdata->q[0]) * (icmdata->q[1]), 2.0f * (icmdata->q[0]) * (icmdata->q[0]) + 2.0f * (icmdata->q[3]) * (icmdata->q[3]) - 1.0f);
+    euler[2] = atan2f(2.0f * (icmdata->q[1]) * (icmdata->q[2]) - 2.0f * (icmdata->q[0]) * (icmdata->q[3]), 2.0f * (icmdata->q[0]) * (icmdata->q[0]) + 2.0f * (icmdata->q[1]) * (icmdata->q[1]) - 1.0f);
     return;
 }
 
-void calc_gps(double *direction, double *distance) {
-    while (1) {
-        if (/*新しいデータ*/) {
-            int32_t dx = ((goal_longitude - //long) * LONGITUDE_PER_RES);//0.000001度で0.092m(京田辺)，0.085m(能代)より，単位メートル
-            int32_t dy = ((goal_latitude - //lat) * LATITUDE_PER_RES);//0.000001度で0.111m(111)より0.1
-            
-            if (dx == 0 && dy == 0) *direction = 0;
-            else *direction = atan2(dx, dy);//意図的にdx, dyの順，というのも，北基準だから．
-            *distance = approx_distance(dx, dy) / 10;//単位:cm
-        }
-        
-    }
-    
+// motor
+int16_t limit_pwm_1023(int16_t pwm) {
+    pwm = constrain(pwm, -1023, 1023);
+    return pwm;
 }
 
-/*平方根を使わず2点間の距離を近似*/
-//参考
-//https://nowokay.hatenablog.com/entry/20120604/1338773843
-//https://dora.bk.tsukuba.ac.jp/~takeuchi/?%E3%83%97%E3%83%AD%E3%82%B0%E3%83%A9%E3%83%9F%E3%83%B3%E3%82%B0%2F%E5%B9%B3%E6%96%B9%E6%A0%B9%E3%82%92%E4%BD%BF%E3%82%8F%E3%81%9A%E3%81%AB%E8%B7%9D%E9%9B%A2%E3%82%92%E6%B1%82%E3%82%81%E3%82%8B
-int32_t approx_distance(int32_t dx, int32_t dy) {
-   uint32_t min, max, approx;
+int16_t limit_pwm_800(int16_t pwm) {
+    pwm = constrain(pwm, -800, 800);
+    return pwm;
+}
 
-   if (dx < 0) dx = -dx;
-   if (dy < 0) dy = -dy;
+// gps
+static void gpgga_callout(nmeap_context_t *context, void *data, void *user_data) {
+    gps_isready = true;
+}
 
-   if (dx < dy) {
-      min = dx;
-      max = dy;
-   } else {
-      min = dy;
-      max = dx;
-   }
+#if 1
+void calc_gps(float *direction, int32_t *distance, int32_t long_now, int32_t lat_now) {
+    int32_t dx = ((goal_longitude - long_now) * long_per_res);//0.000001度で0.092m(京田辺)，0.085m(能代)より，単位メートル
+    int32_t dy = ((goal_latitude - lat_now) * lat_per_les);//0.000001度で0.111m(111)より0.1
+    
+    if (dx == 0 && dy == 0) *direction = 0;
+    else *direction = atan2(dx, dy);//意図的にdx, dyの順，というのも，北基準だから．
+    *distance = approx_distance(dx, dy) / 10;//単位:cm
+    *distance = abs(*distance);
+    printf("calc_gps: dx %d, dy %d, dir %f, dist %d\n", dx, dy, *direction, *distance);
+    printf("long_now %d, lat_now %d, long_goal %d, lat_goal %d\n", long_now, lat_now, goal_longitude, goal_latitude);
+}
+#endif
 
-   approx = (max * 983) + (min * 407);
-   if (max < (min << 4)) approx -= ( max * 40 );
+#if 0
+void calc_gps(float *dir, float *dist, double lon, double lat) {
+    double A  = 6378137;
+    double dlong = (goal_longitude - lon);
+    double dlat  = (goal_latitude - lat);
+    double dx = (dlong * cos(lat) * A);
+    double dy = (dlat * A);
+    *dir = atan2f(dy, dx);
+    *dist = sqrt(dx*dx + dy*dy);
+    printf("calc_gps: dx %f, dy %f, dir %f, dist %f\n", dx, dy, *dir, *dist);
+    printf("long_now %f, lat_now %f, long_goal %f, lat_goal %f\n", lon, lat, goal_longitude, goal_latitude);
+}
+#endif
 
-   // add 512 for proper rounding
-   return ((approx + 512) >> 10);
-} 
+void mode_wait() {
+    static bool is_removed = false;
+    static int32_t cnt = 0;
+
+    if (cnt > wait_count) {
+        mode_now = MODE_LANDING;
+        printf("cnt > wait_count, cnt: %d\n", cnt);
+        return;
+    }
+    
+    if (gpio_get(flight_pin)) {
+        // removed
+        cnt++;
+        printf("cnt: %d\n", cnt);
+    }
+}
+
+void mode_landing() {
+    printf("mode_landing\n");
+    static int32_t count = 0;
+    gpio_put(nichrome_pin, 1);
+
+    count++;
+    if (count > 150) {
+        gpio_put(nichrome_pin, 0);
+        printf("nichrome end\n");
+        mode_now = MODE_FORWARD_LANDING;
+    } 
+
+#if 0
+    motor_rotate(slice_left, 800);
+    motor_rotate(slice_right, 800);
+
+    sleep_ms(3000);
+
+    motor_rotate(slice_left, 0);
+    motor_rotate(slice_right, 0);
+#endif
+
+}
+
+void mode_forward_landing() {
+    static int32_t cnt = 0;
+
+    motor_rotate(slice_left, 800);
+    motor_rotate(slice_right, 800);
+
+    if (cnt > 200) {
+        motor_rotate(slice_left, 0);
+        motor_rotate(slice_right, 0);
+        mode_now = MODE_GNSS;
+    }
+    cnt++;
+}
+
+void mode_gnss() {
+    //printf("mode_gnss\n");
+    static float dir, yaw;
+    static int32_t dist;
+    static int16_t times = 0;
+    static float error[2] = {0}, integral = 0;
+    //static bool isfirst = true;
+
+    if (gps_isready) {
+        gps_isready = false;
+        printf("gps_isready: true, %.6f,%.6f, sat %d\n", gga.latitude, gga.longitude, gga.satellites);
+        int32_t lon = (int32_t)(gga.longitude * 1000000);
+        int32_t lat = (int32_t)(gga.latitude * 1000000);
+        calc_gps(&dir, &dist, lon, lat);
+        if (dist < 150) {
+            mode_now = MODE_FORWARD_TOF;
+        }
+        //calc_gps(&dir, &dist, gga.longitude, gga.latitude);
+        //if (gga.longitude == 0.0) is_valid = false;
+    }
+    if ((times == 10)) {
+        times = 0;
+        yaw = icm20948_calc_yawmag();
+        //yaw += (M_PI * 0.5);
+        printf("yaw %f dir %f dir-th %f dir+t %f\n", yaw, dir, dir-angle_th, dir+angle_th);
+
+        if ((yaw > dir-angle_th) && (yaw < dir+angle_th)) {
+            motor_rotate(slice_left, 900);
+            motor_rotate(slice_right, 900);
+        } else if (yaw < (dir-angle_th)) {
+            // 右旋回
+            motor_rotate(slice_left, 900);
+            //motor_rotate(slice_right, (pwm -(pwm * 0.5)));
+            motor_rotate(slice_right, 650);
+        } else if (yaw > (dir+angle_th)) {
+            // 左旋回
+            //pwm = -pwm;
+            //motor_rotate(slice_left, (pwm -(pwm * 0.5)));
+            motor_rotate(slice_left, 650);
+            motor_rotate(slice_right, 900);
+        }
+
+#if 0
+    if (isfirst) {
+        isfirst = false;
+        pid_init(0.1, 300.0, 0.0, 100.0);
+    }
+    //bool is_valid = true;
+    if (gps_isready) {
+        gps_isready = false;
+        printf("gps_isready: true, %.6f,%.6f, sat %d\n", gga.latitude, gga.longitude, gga.satellites);
+        int32_t lon = (int32_t)(gga.longitude * 1000000);
+        int32_t lat = (int32_t)(gga.latitude * 1000000);
+        calc_gps(&dir, &dist, lon, lat);
+        //if (gga.longitude == 0.0) is_valid = false;
+    }
+    if ((times == 10)) {
+        times = 0;
+        yaw = icm20948_calc_yawmag();
+        int16_t pwm = (int16_t)pid_calc(yaw, dir, error, &integral);
+        printf("pwm %4d e[2] %3.2f yaw %3.2f i %f\n", pwm, euler[2], yaw, integral);
+        pwm = ((pwm>0)?(pwm+500):((pwm<0)?(pwm-500):0));
+        pwm = limit_pwm_800(pwm);
+
+        if ((yaw > dir-angle_th) && (yaw < dir+angle_th)) {
+            motor_rotate(slice_left, pwm);
+            motor_rotate(slice_right, pwm);
+        } else if (pwm > 0) {
+            // 右旋回
+            motor_rotate(slice_left, pwm);
+            //motor_rotate(slice_right, (pwm -(pwm * 0.5)));
+            motor_rotate(slice_right, 0);
+        } else if (pwm < 0) {
+            // 左旋回
+            pwm = -pwm;
+            //motor_rotate(slice_left, (pwm -(pwm * 0.5)));
+            motor_rotate(slice_left, 0);
+            motor_rotate(slice_right, pwm);
+        }
+#endif
+
+#if 0
+        float angle = dir - yaw;
+        while (angle > M_PI) angle -= M_PI;
+        while (angle < (-M_PI)) angle += M_PI;
+        printf("yaw %f dir %f angle %f, angle-th %f, angle+th %f\n", yaw, dir, angle, (angle-angle_th), (angle+angle_th));
+
+        if (abs(angle) < angle_th) {
+            printf("going straight\n");
+            motor_rotate(slice_left, 800);
+            motor_rotate(slice_right, 800);
+        } else if (angle < (angle_th)) {
+            // 右回転
+            motor_rotate(slice_left, 800);
+            motor_rotate(slice_right, 0);
+        } else {
+            // 左回転
+            motor_rotate(slice_left, 0);
+            motor_rotate(slice_right, 800);
+        }
+#endif
+    }
+    times++;
+}
+
+void mode_forward_tof() {
+    static int32_t cnt = 0;
+
+    motor_rotate(slice_left, 800);
+    motor_rotate(slice_right, 800);
+
+    if (cnt > 100) {
+        motor_rotate(slice_left, 0);
+        motor_rotate(slice_right, 0);
+        mode_now = MODE_TOF;
+    }
+    cnt++;
+}
+
+void mode_tof() {
+    printf("mode_tof\n");
+    static int8_t i = 0;
+    static int16_t tof_mat[4][64];
+    static int32_t history[20] = {4000};
+    int8_t lflg = 0;
+    uint8_t tof_status;
+    static bool isfirst = true;
+
+#if 0
+    vl53l5cx_check_data_ready(&tof_dev, &tof_isready);
+    if (tof_isready) {
+        printf("tof ready\n");
+        vl53l5cx_get_ranging_data(&tof_dev, &tof_res);
+
+        for (int8_t j = 0; j < 64; j++) {
+            if (tof_res.distance_mm[j] < 1000) lflg++; 
+        }
+        printf("lflg: %d\n", lflg);
+
+        if (lflg > 32) {
+            printf("tof straight\n");
+            motor_rotate(slice_left, 850);
+            motor_rotate(slice_right, 850);
+        } else {
+            printf("tof_left-only\n");
+            motor_rotate(slice_left, 850);
+            motor_rotate(slice_right, 0);
+        }
+    }
+#endif
+
+#if 1
+    if (isfirst) {
+        isfirst = false;
+        cancel_repeating_timer(&timer);
+    }
+
+    vl53l5cx_check_data_ready(&tof_dev, &tof_isready);
+    if (tof_isready) {
+        vl53l5cx_get_ranging_data(&tof_dev, &tof_res);
+
+        // qsortからの中央値だして比較？
+        if (i == 2) {
+            lflg = 0;
+            i = 0;
+            for (int j = 0; j < 64; j++) tof_mat[3][j] = (tof_mat[1][j] + tof_mat[2][j] + tof_mat[3][j]) / 3;
+
+            for (int j = 0; j < 20-1; j++) history[j] = history[j+1];
+            for (int j = 0; j < 64; j++) history[19] += tof_mat[3][j];
+            history[19] /= 64;
+
+            printf("h[19] %d\n", history[19]);
+
+            if (history[19] < 1000) {
+                motor_rotate(slice_left, 850);
+                motor_rotate(slice_right, 850);
+                return;
+            }
+
+            if (history[19] < 200) {
+                bool isgoal = is_goal();
+                if (is_goal) {
+                    mode_now = MODE_GOAL;
+                    return;
+                } else {
+                    mode_now = MODE_GNSS;
+                    return;
+                }
+            }
+
+            for (int8_t j = 0; j < 19; j++) {
+                if (history[i] > history[19]) lflg++;
+            }
+            //printf("h1: %d h2: %d h3: %d h18: %d\n", history[1], history[2], history[3], history[18]);
+            printf("lflg: %d, h19: %d\n", lflg, history[19]);
+
+            if (lflg > 18) {
+                motor_rotate(slice_left, 800);
+                motor_rotate(slice_right, 800);
+                printf("staright!\n");
+            } else {
+                motor_rotate(slice_left, 800);
+                motor_rotate(slice_right, 0);
+                printf("rotate\n");
+            }
+        }
+
+        for (int j = 0; j < 64; j++) tof_mat[i][j] = tof_res.distance_mm[j];
+        i++;
+    }
+#endif
+}
+
+bool is_goal() {
+    printf("is_goal\n");
+    float dir;
+    int32_t dist;
+    bool gps = false, tof = false;
+    int8_t tof_count = 0;
+    int16_t tof_mat[64];
+    uint8_t tof_isready;
+
+    while (1) {
+        if (gps_isready) {
+            int32_t lon = (int32_t)(gga.longitude * 1000000);
+            int32_t lat = (int32_t)(gga.latitude * 1000000);
+            calc_gps(&dir, &dist, lon, lat);
+            if (dist < 2.0) gps = true;
+        }
+
+        vl53l5cx_check_data_ready(&tof_dev, &tof_isready);
+        if (tof_isready) {
+            vl53l5cx_get_ranging_data(&tof_dev, &tof_res);
+            for (int8_t i = 0; i < 64; i++) {
+                if (tof_res.distance_mm[i] < 120) tof_count++;
+            }
+            if (tof_count > 35) tof = true;
+        }
+
+        if (gps && tof) return true;
+        else if (gps_isready && tof_isready) return false;
+    }
+
+
+}
+
+void mode_goal() {
+    printf("mode_goal\n");
+    while(1) tight_loop_contents();
+}
+
+// overall
+bool update_all(repeating_timer_t *rt) {
+    static float accel_g[3] = {0}, gyro_dps[3] = {0};
+    uint8_t buf[11];
+    icm20948_read_all();
+    icm20948_calc_data(accel_g, gyro_dps);
+    MadgwickAHRSupdateIMU(&filter, gyro_dps[0], gyro_dps[1], gyro_dps[2], accel_g[0] * 9.8, accel_g[1] * 9.8, accel_g[2] * 9.8);
+    q2e(&filter, euler);
+
+    switch (mode_now)
+    {
+    case MODE_WAIT:
+        mode_wait();
+        break;
+    case MODE_LANDING:
+        mode_landing();
+        break;
+    case MODE_FORWARD_LANDING:
+        mode_forward_landing();
+        break;
+    case MODE_GNSS:
+        mode_gnss();
+        break;
+    case MODE_FORWARD_TOF:
+        mode_forward_tof();
+        break;
+    case MODE_TOF:
+        mode_tof();
+        break;
+    case MODE_GOAL:
+        mode_goal();
+        break;
+    }
+}
 
 int main(void) {
     stdio_init_all();
+
+    // gnss on
+    gpio_init(gnss_vcc_pin);
+    gpio_set_dir(gnss_vcc_pin, GPIO_OUT);
+    gpio_put(gnss_vcc_pin, 0);
+
+    // flight pin
+    gpio_init(flight_pin);
+    gpio_set_dir(flight_pin, GPIO_IN);
 
     // i2c0
     // vl53l5cx
@@ -109,17 +537,31 @@ int main(void) {
     gpio_set_function(i2c0_scl_pin, GPIO_FUNC_I2C);
     gpio_set_function(i2c0_sda_pin, GPIO_FUNC_I2C);
 
-    uint8_t status, is_ready, is_alive;
-    VL53L5CX_Configuration dev;
-    VL53L5CX_ResultsData res;
+    uint8_t tof_status, is_ready, is_alive;
+    VL53L5CX_Configuration tof_dev;
+    VL53L5CX_ResultsData tof_res;
 
-    dev.platform.address = 0x29;
-    dev.platform.i2c     = &vl53l5cx_i2c;
-    status = vl53l5cx_is_alive(&dev, &is_alive);
-    status = vl53l5cx_init(&dev);
-    if (status) printf("vl53l5cx: ULD load failed\n");
-    if (!status) printf("vl53l5cx: OK\n");
+    tof_dev.platform.address = 0x29;
+    tof_dev.platform.i2c     = &vl53l5cx_i2c;
+    tof_status = vl53l5cx_is_alive(&tof_dev, &is_alive);
+    tof_status = vl53l5cx_init(&tof_dev);
+    if (tof_status) printf("vl53l5cx: ULD load failed\n");
+    if (!tof_status) printf("vl53l5cx: OK\n");
     else printf("vl53l5cx: NG\n");
+    // 8x8
+    tof_status = vl53l5cx_set_resolution(&tof_dev, VL53L5CX_RESOLUTION_8X8);
+    if (tof_status) printf("err: set_resolution\n");
+    // 5Hz
+    tof_status = vl53l5cx_set_ranging_frequency_hz(&tof_dev, 15);
+    if (tof_status) printf("err: set_ranging_frequency_hz\n");
+    // strongest -> closest
+    tof_status = vl53l5cx_set_target_order(&tof_dev, VL53L5CX_TARGET_ORDER_CLOSEST);
+    if (tof_status) printf("err: set_target_order\n");
+    // continuous
+    tof_status = vl53l5cx_set_ranging_mode(&tof_dev, VL53L5CX_RANGING_MODE_CONTINUOUS);
+    if (tof_status) printf("err: set_ranging_mode\n");
+    tof_status = vl53l5cx_start_ranging(&tof_dev);
+    if (tof_status) printf("err: start_ranging\n");
 
     // i2c1
     // icm-20948
@@ -129,65 +571,17 @@ int main(void) {
     gpio_set_function(i2c1_scl_pin, GPIO_FUNC_I2C);
     if (icm20948_init(&config) == 0) printf("icm20948: OK\n");
     else printf("icm20948: NG\n");
+    icm20948_cal_gyro(&config, &icmdata.gyro_bias[0]);
+    printf("calibrated gyro: %d %d %d\n", icmdata.gyro_bias[0], icmdata.gyro_bias[1], icmdata.gyro_bias[2]);
+    icm20948_cal_accel(&config, &icmdata.accel_bias[0]);
+    printf("calibrated accel: %d %d %d\n", icmdata.accel_bias[0], icmdata.accel_bias[1], icmdata.accel_bias[2]);
 
-    // eeprom
-    uint8_t wbuf[10] = {0};
-    uint8_t rbuf[10] = {'0'};
-    for (uint8_t i = 0; i < 10; i++) wbuf[i] = 33 + i;
-    printf("write:\n");
-    for (uint8_t i = 0; i < 10; i++) printf("%c", wbuf[i]);
-    printf("\n");
-    int16_t ret = eeprom_write_multi(i2c1, 0x50, 0x00000, wbuf, 10);
-    if (ret > 0) printf("eeprom write: OK\n");
-    else printf("eeprom write: NG\n");
-    ret = eeprom_read(i2c1, 0x50, 0x0000, rbuf, 10);
-    if (ret > 0) printf("eeprom read: OK\n");
-    else printf("eeprom read: NG\n");
-    for (int8_t i = 0; i < 10; i++) printf("%c", rbuf[i]);
-    printf("\n");
 
-    // gnss
-    gpio_init(gnss_vcc_pin);
-    gpio_set_dir(gnss_vcc_pin, GPIO_OUT);
-    gpio_put(gnss_vcc_pin, 0);
+// タイヤ白黒機体 
+//icmdata.mag_bias[0] = 110; icmdata.mag_bias[1] = 209; icmdata.mag_bias[2] = -308;
+// タイヤ黄色機体
+icmdata.mag_bias[0] = 41; icmdata.mag_bias[1] = 847; icmdata.mag_bias[2] = -610;
 
-    uart_init(uart1, 9600);
-    gpio_set_function(gnss_tx_pin, GPIO_FUNC_UART);
-    gpio_set_function(gnss_rx_pin, GPIO_FUNC_UART);
-    uart_set_baudrate(uart1, 9600);
-    uart_set_hw_flow(uart1, false, false);
-    uart_set_format(uart1, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(uart1, true);
-
-    
-    sleep_ms(5000);
-
-    uint8_t buf[100] = {'\0'};
-    int16_t n;
-    if (n = uart_is_readable(uart1)) {
-        uart_read_blocking(uart1, buf, 50);
-        printf("%s\n", buf);
-    }
-    if (n > 0) printf("gnss: OK, n: %d\n", n);
-    else printf("gnss: NG, n: %d\n", n);
-
-    // motor, encoder
-    uint8_t sleft = motor_init(motor_left_a_pin);
-    uint8_t sright = motor_init(motor_right_a_pin);
-    PIO pio = pio0;
-    uint32_t delta[2];
-    motor_rotate(sleft, 800);
-    motor_rotate(sright, 800);
-    sleep_ms(1000);
-    quadrature_encoder_two_pio_init(pio, 0, encoder_left_a_pin, encoder_right_a_pin);
-    sleep_ms(10);
-    quadrature_encoder_update_delta(pio, 0, delta);
-    if (delta[0] > 30) printf("motor_left: OK, delta: %d\n", delta[0]);
-    else printf("motor_left: NG\n");
-    if (delta[1] > 30) printf("motor_right: OK, delta: %d\n", delta[1]);
-    else printf("motor_right: NG\n");
-    motor_rotate(sleft, 0);
-    motor_rotate(sright, 0);
 
     // health check
     float current, voltage;
@@ -197,22 +591,39 @@ int main(void) {
     printf("health: %f V, %f A\n", voltage, current);
 
     // nichrome
-    printf("check nichrome\n");
-    sleep_ms(1000);
     gpio_init(nichrome_pin);
     gpio_set_dir(nichrome_pin, GPIO_OUT);
-    gpio_put(nichrome_pin, 1);
-    sleep_ms(500);
-    gpio_put(nichrome_pin, 0);
-    sleep_ms(2000);
 
     // led
     gpio_init(led_pin);
 
+    // motor, encoder
+    slice_left = motor_init(motor_left_a_pin);
+    slice_right = motor_init(motor_right_a_pin);
+    
+    quadrature_encoder_two_pio_init(pio, 0, encoder_left_a_pin, encoder_right_a_pin);
+    motor_rotate(slice_left, 0);
+    motor_rotate(slice_right, 0);
+
+    // gnss
+    uart_init(uart1, 9600);
+    gpio_set_function(gnss_tx_pin, GPIO_FUNC_UART);
+    gpio_set_function(gnss_rx_pin, GPIO_FUNC_UART);
+    uart_set_baudrate(uart1, 9600);
+    uart_set_hw_flow(uart1, false, false);
+    uart_set_format(uart1, 8, 1, UART_PARITY_NONE);
+    //uart_set_fifo_enabled(uart1, true);
+    uart_set_fifo_enabled(uart1, false);
+    irq_set_exclusive_handler(UART1_IRQ, on_uart_rx);
+    irq_set_enabled(UART1_IRQ, true);
+    uart_set_irq_enables(uart1, true, false);
+
+    nmeap_init(&nmea, NULL);
+    nmeap_addParser(&nmea, "GNGGA", nmeap_gpgga, gpgga_callout, &gga);
+
+    add_repeating_timer_ms(-10, &update_all, NULL, &timer);
+
     while (1) {
-        // GPSのデータ取得
-
-        // 
+        tight_loop_contents();
     }
-
 }

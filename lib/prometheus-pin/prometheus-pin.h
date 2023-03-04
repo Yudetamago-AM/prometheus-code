@@ -44,4 +44,7 @@ const uint led_pin            = 2;
 // nichrome
 const uint nichrome_pin       = 17;
 
+// flight pin
+const uint flight_pin         = 13;
+
 #endif

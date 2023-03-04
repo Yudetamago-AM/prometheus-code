@@ -3,8 +3,11 @@
 #include "hardware/uart.h"
 #include "../nmeap-0.3/inc/nmeap.h"
 
+static bool is_ready = false;
+
 static void print_gga(nmeap_gga_t *gga) {
-    printf("found GPGGA message %.6f %.6f %.0f %lu %d %d %f %f\n",
+    is_ready = false;
+    printf("lat %.10f, long %.10f, alt %.0f, time %lu, sat %d, qu %d, dop %f, gh %f\n",
             gga->latitude  ,
             gga->longitude, 
             gga->altitude , 
@@ -18,7 +21,7 @@ static void print_gga(nmeap_gga_t *gga) {
 
 /** called when a gpgga message is received and parsed */
 static void gpgga_callout(nmeap_context_t *context,void *data,void *user_data) {
-    
+    is_ready = true;
 }
 
 int main(void) {
@@ -57,6 +60,7 @@ int main(void) {
         }
         for (uint i = 0; i < 100; i++) buf[i] = '\0';
 
+        if (is_ready == true) print_gga(&gga);
         sleep_ms(10);
     }
 
