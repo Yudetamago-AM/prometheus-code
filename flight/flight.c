@@ -46,12 +46,12 @@ static float euler[3] = {0};
 
 // SETTINGS
 // 白黒 COM5
-//const int32_t goal_longitude = 130960119;
-//const int32_t goal_latitude  =  30374279;
+const int32_t goal_longitude = 130960119;
+const int32_t goal_latitude  =  30374279;
 
 // 黄色 COM3
-const int32_t goal_longitude = 130960121;
-const int32_t goal_latitude  =  30374280;
+//const int32_t goal_longitude = 130960121;
+//const int32_t goal_latitude  =  30374280;
 
 // 初期モード
 static uint mode_now = MODE_WAIT;
@@ -82,23 +82,24 @@ static uint8_t slice_right;
 PIO pio = pio0;
 uint32_t delta[2];
 
-uint8_t logbuf[10000] = {0};
+static uint8_t logbuf[3000] = {0};
 
 bool update_all(repeating_timer_t *rt);
 bool is_goal();
 void calc_gps(float *direction, int32_t *distance, int32_t long_now, int32_t lat_now);
 //void calc_gps(float *dir, float *dist, double lon, double lat);
 
-#if 0
-//int16_t //elog_ret;
-void //elog(uint8_t *src, int16_t len) {
-    static uint8_t t[100];
+#if 1
+//int16_t elog_ret;
+void elog(uint8_t *src, int16_t len) {
+    if (logh+8+len > 3000) return;
+    uint8_t t[100] = {'\0'};
     snprintf(t, 8+len, "%06d,%s", gga.time, src);
-    printf("%s", t);
+    //printf("%s", t);
     for (int16_t i = 0; i < (len+8); i++) {
         logbuf[i+logh] = t[i];
     }
-    ////elog_ret = eeprom_write_multi(i2c1, 0x50, logh, t, len+7);
+    //elog_ret = eeprom_write_multi(i2c1, 0x50, logh, t, len+7);
     logh += 7;
     logh += len;
 }
@@ -194,24 +195,24 @@ void calc_gps(float *dir, float *dist, double lon, double lat) {
 void mode_wait() {
     static bool is_removed = false;
     static int32_t cnt = 0;
-    //static bool isfirst = true;
-    //static uint8_t str[] = "fpin removed\n";
-    //static uint8_t str2[] = "wait end\n";
+    static bool isfirst = true;
+    static uint8_t str[] = "fpin removed\n";
+    static uint8_t str2[] = "wait end\n";
 
     if (cnt > wait_count) {
         mode_now = MODE_LANDING;
         printf("cnt > wait_count, cnt: %d\n", cnt);
-        //elog(str2, 9);
+        elog(str2, 9);
         return;
     }
     
     if (gpio_get(flight_pin)) {
-        /*
+#if 1
         if (isfirst) {
             isfirst = false;
-            //elog(str, 13);
+            elog(str, 13);
         }
-        */
+#endif
         // removed
         cnt++;
         printf("cnt: %d\n", cnt);
@@ -220,11 +221,11 @@ void mode_wait() {
 
 void mode_landing() {
     static bool isfirst = true;
-    static uint8_t str[] = "nichr heat st\n";
+    static uint8_t str[]  = "nichr heat st\n";
     static uint8_t str2[] = "nichr heat end\n";
     if (isfirst) {
         isfirst = false;
-        //elog(str, (sizeof(str)/sizeof(uint8_t)-1));
+        elog(str, 14);
     }
     printf("mode_landing\n");
     static int32_t count = 0;
@@ -234,21 +235,21 @@ void mode_landing() {
     if (count > 150) {
         gpio_put(nichrome_pin, 0);
         printf("nichrome end\n");
-        //elog(str2, (sizeof(str2)/sizeof(uint8_t)-1));
+        elog(str2, 15);
         mode_now = MODE_FORWARD_LANDING;
     }
 
 }
 
 void mode_forward_landing() {
-    //static uint8_t str[] = "mf 2s\n";
+    static uint8_t str[] = "mf 2s\n";
     static int32_t cnt = 0;
 
     motor_rotate(slice_left, 800);
     motor_rotate(slice_right, 800);
 
     if (cnt > 200) {
-        //elog(str, (sizeof(str)/sizeof(uint8_t)-1));
+        elog(str, 6);
         motor_rotate(slice_left, 0);
         motor_rotate(slice_right, 0);
         mode_now = MODE_GNSS;
@@ -257,21 +258,20 @@ void mode_forward_landing() {
 }
 
 void mode_gnss() {
-    //static uint8_t str[] = "gnss\n";
-    //static uint8_t str2[20];
-    //static uint8_t str3[11];
+    static uint8_t str[] = "gnss\n";
+    static uint8_t str2[20];
+    static uint8_t str3[11];
     static bool isfirst = true;
-    //printf("mode_gnss\n");
+    printf("mode_gnss\n");
     static float dir, yaw;
     static int32_t dist;
     static int16_t times = 0;
-    //static int16_t ttimes = 0;
+    static int16_t ttimes = 0;
     static float error[2] = {0}, integral = 0;
-    //static bool isfirst = true;
 
     if (isfirst) {
         isfirst = false;
-        //elog(str, (sizeof(str)/sizeof(uint8_t)-1));
+        elog(str, 5);
     }
 
     if (gps_isready) {
@@ -283,23 +283,23 @@ void mode_gnss() {
         if (dist < 70) {
             mode_now = MODE_FORWARD_TOF;
         }
-        //snprintf(str2, 19, "%d,%d\n", lat, lon);
-        //elog(str2, (sizeof(str2)/sizeof(uint8_t)-1));
+        snprintf(str2, 19, "%d,%d\n", lat, lon);
+        elog(str2, 18);
         //calc_gps(&dir, &dist, gga.longitude, gga.latitude);
         //if (gga.longitude == 0.0) is_valid = false;
     }
     if ((times == 10)) {
         times = 0;
         yaw = icm20948_calc_yawmag();
-        //int16_t l, r;
+        int16_t l, r;
         //printf("yaw %f dir %f dir-th %f dir+t %f\n", yaw, dir, dir-angle_th, dir+angle_th);
         if ((yaw > dir-angle_th) && (yaw < dir+angle_th)) {
-            //l = 900; r = 900;
+            l = 900; r = 900;
             printf("straight\n");
             motor_rotate(slice_left, 900);
             motor_rotate(slice_right, 900);
         } else if (yaw < (dir-angle_th)) {
-            //l = 900; r = 650;
+            l = 900; r = 650;
             // 右旋回
             printf("right\n");
             motor_rotate(slice_left, 900);
@@ -308,7 +308,7 @@ void mode_gnss() {
             // 左旋回
             //pwm = -pwm;
             printf("left\n");
-            //l = 650; r = 900;
+            l = 650; r = 900;
             motor_rotate(slice_left, 650);
             motor_rotate(slice_right, 900);
         } else {
@@ -316,14 +316,14 @@ void mode_gnss() {
             motor_rotate(slice_left, 900);
             motor_rotate(slice_right, 650);
         }
-        /*
+#if 1
         if (ttimes == 10) {
             ttimes = 0;
             snprintf(str3, 11, "mr,%d%d\n", l, r);
-            //elog(str3, 10);
+            elog(str3, 10);
         }
         ttimes++;
-        */
+#endif
     }
     times++;
 }
@@ -349,8 +349,8 @@ void mode_tof() {
     int8_t lflg = 0;
     uint8_t status;
     static bool isfirst = true;
-    //static int8_t lflg_cnt = 0;
-    //printf("mode_tof\n");
+    static int8_t lflg_cnt = 0;
+    printf("mode_tof\n");
 
 #if 1
     status = vl53l5cx_check_data_ready(&tof_dev, &tof_isready);
@@ -387,11 +387,11 @@ void mode_tof() {
             }
             if (lflg > 32) {
                 printf("tof straight\n");
-                motor_rotate(slice_left, 850);
-                motor_rotate(slice_right, 850);
+                motor_rotate(slice_left, 950);
+                motor_rotate(slice_right, 950);
             } else {
                 printf("tof_left-only\n");
-                motor_rotate(slice_left, 850);
+                motor_rotate(slice_left, 950);
                 motor_rotate(slice_right, 0);
             }
 
@@ -430,8 +430,8 @@ void mode_tof() {
             printf("h[19] %d\n", history[19]);
 
             if (history[19] < 1000) {
-                motor_rotate(slice_left, 850);
-                motor_rotate(slice_right, 850);
+                motor_rotate(slice_left, 950);
+                motor_rotate(slice_right, 950);
                 return;
             } 
 
@@ -472,7 +472,7 @@ void mode_tof() {
 
 bool is_goal() {
     printf("is_goal\n");
-    //static uint8_t str[18];
+    static uint8_t str[18];
     float dir;
     int32_t dist;
     bool gps = false, tof = false;
@@ -496,8 +496,8 @@ bool is_goal() {
             if (tof_count > 35) tof = true;
         //}
 
-        //snprintf(str, 17, "isg,d%04d,t%02d\n", dist, tof_count);
-        //elog(str, 16);
+        snprintf(str, 17, "isg,d%04d,t%02d\n", dist, tof_count);
+        elog(str, 16);
 
         if (gps && tof) return true;
         else if (gps_isready && tof_isready) return false;
@@ -508,13 +508,13 @@ bool is_goal() {
 void mode_goal() {
     cancel_repeating_timer(&timer);
     static bool isfirst = true;
-    //static uint8_t str[] = "goal!\n";
-    //if (isfirst) {
-        //isfirst = false;
-        //elog(str, 6);
-    //}
+    static uint8_t str[] = "goal!\n";
+    if (isfirst) {
+        isfirst = false;
+        elog(str, 6);
+    }
 
-    //eeprom_write_multi(i2c1, 0x50, 0x0000, logbuf, 100000);
+    eeprom_write_multi(i2c1, 0x50, 0x0000, logbuf, logh);
     printf("mode_goal\n");
     while(1) tight_loop_contents();
 }
